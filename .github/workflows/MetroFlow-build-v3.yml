@@ -1,0 +1,120 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - name: Unpack app files from the zip
+        run: |
+          if [ -f metroFlow-upload.zip ]; then unzip -o metroFlow-upload.zip; fi
+          mkdir -p www
+          cp index.html style.css app.js analysis.js sw.js manifest.webmanifest icon.svg Tone.js www/
+      - name: Point the app at the live website
+        run: |
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "com.metroflow.app",
+            "appName": "MetroFlow",
+            "webDir": "www",
+            "server": { "url": "https://metroflow.elisha-keyboard.workers.dev", "androidScheme": "https" },
+            "plugins": { "CapacitorHttp": { "enabled": true } }
+          }
+          JSON
+      - run: npm install
+      - run: npx cap add android
+      - name: Allow the microphone for tempo detection
+        run: |
+          sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <application#' android/app/src/main/AndroidManifest.xml
+          grep -n "RECORD_AUDIO" android/app/src/main/AndroidManifest.xml
+      - name: Write the icon script
+        run: |
+          cat > make_assets.py <<'PYEOF'
+          # Builds Android launcher icons and splash screens from logo.png. Run from the project root after "cap add android".
+          import os, glob
+          from PIL import Image, ImageDraw, ImageFilter
+          src = Image.open('logo.png').convert('RGB')
+          W = src.size[0]
+          k = W / 1254.0
+          # the rounded tile inside the picture
+          box = tuple(int(v * k) for v in (62, 60, 1192, 1190))
+          tile = src.crop(box).convert('RGBA')
+          def rounded(im, radius):
+              m = Image.new('L', im.size, 0)
+              ImageDraw.Draw(m).rounded_rectangle([0, 0, im.size[0] - 1, im.size[1] - 1], radius=radius, fill=255)
+              im = im.copy(); im.putalpha(m); return im
+          tile = rounded(tile, int(0.2 * tile.size[0]))
+          BG = (8, 108, 114)
+          res = 'android/app/src/main/res'
+          def sz(im, n): return im.resize((n, n), Image.LANCZOS)
+          dens = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          for d, n in dens.items():
+              out = f'{res}/mipmap-{d}'
+              sz(tile, n).save(f'{out}/ic_launcher.png')
+              c = sz(tile, n); m = Image.new('L', (n, n), 0); ImageDraw.Draw(m).ellipse([0, 0, n - 1, n - 1], fill=255)
+              flat = Image.new('RGBA', (n, n), (0, 0, 0, 0)); flat.paste(sz(src.crop(tuple(int(v * k) for v in (100, 100, 1154, 1154))).convert('RGBA'), n), (0, 0)); flat.putalpha(m); flat.save(f'{out}/ic_launcher_round.png')
+              f = int(n * 108 / 48)
+              canvas = Image.new('RGBA', (f, f), (0, 0, 0, 0)); t = sz(tile, int(f * 0.62))
+              canvas.paste(t, ((f - t.size[0]) // 2, (f - t.size[1]) // 2), t); canvas.save(f'{out}/ic_launcher_foreground.png')
+          open(f'{res}/values/ic_launcher_background.xml', 'w').write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#%02X%02X%02X</color>\n</resources>\n' % BG)
+          # splash screens: diagonal teal gradient that matches the logo's own surroundings, logo tile in the middle
+          c1, c2 = (10, 132, 135), (47, 207, 204)
+          def splash(w, h):
+              g = Image.new('RGB', (64, 64))
+              px = g.load()
+              for y in range(64):
+                  for x in range(64):
+                      t = (x + y) / 126.0
+                      px[x, y] = tuple(int(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+              g = g.resize((w, h), Image.BICUBIC).convert('RGBA')
+              s = int(min(w, h) * 0.5); t = sz(tile, s)
+              g.paste(t, ((w - s) // 2, (h - s) // 2), t)
+              return g.convert('RGB')
+          for p in glob.glob(f'{res}/drawable*/splash.png'):
+              w, h = Image.open(p).size
+              splash(w, h).save(p)
+          # Android 12 and newer: colour and icon shown by the system splash
+          sty = f'{res}/values/styles.xml'
+          s = open(sty).read()
+          if 'windowSplashScreenBackground' not in s:
+              s = s.replace('<style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">',
+                            '<style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">\n        <item name="windowSplashScreenBackground">#0A8487</item>\n        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_foreground</item>')
+              open(sty, 'w').write(s)
+          print('icons and splash done')
+          PYEOF
+      - name: Apply the MetroFlow icon and splash screen
+        run: |
+          if [ -f logo.png ]; then
+            pip install --quiet --break-system-packages pillow
+            python3 make_assets.py
+          else
+            echo "logo.png not found, keeping default icon"
+          fi
+      - run: npx cap sync android
+      - name: Use the same signing key every time so updates install over the old app
+        run: |
+          mkdir -p ~/.android
+          echo "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" | base64 -d > ~/.android/debug.keystore
+      - run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+      - name: Name the APK
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk metroFlow.apk
+      - name: Publish the APK as a plain download
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: MetroFlow app
+          body: Download metroFlow.apk and install it (MetroFlow) on your phone.
+          files: metroFlow.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metroFlow-live-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
